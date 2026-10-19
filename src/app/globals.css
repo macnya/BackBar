@@ -1,0 +1,90 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Fraunces", Georgia, "Times New Roman", serif;
+  --font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
+
+  --color-paper-50: #f8f4ec;
+  --color-paper-100: #f1eadb;
+  --color-paper-200: #e5dbc6;
+
+  --color-cream: #fffdf8;
+
+  --color-ink-900: #211a13;
+  --color-ink-700: #52483c;
+  --color-ink-500: #857a6a;
+  --color-ink-300: #b9ad9b;
+
+  --color-line: #e3d9c6;
+
+  --color-copper-50: #fbf1e6;
+  --color-copper-100: #f6e0c8;
+  --color-copper-500: #c95f16;
+  --color-copper-600: #ab4e0e;
+  --color-copper-700: #8d3f0b;
+
+  --color-ok-100: #e2eed6;
+  --color-ok-700: #457a1c;
+  --color-ok-800: #386116;
+
+  --color-warn-100: #f7eccd;
+  --color-warn-700: #a16207;
+  --color-warn-800: #854f06;
+
+  --color-danger-100: #f8e0dc;
+  --color-danger-700: #b3341f;
+  --color-danger-800: #94281a;
+
+  --color-dark-900: #171310;
+  --color-dark-800: #241d17;
+  --color-dark-700: #332a21;
+  --color-dark-300: #a3947f;
+  --color-dark-100: #efe6d8;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    background-color: var(--color-paper-50);
+    color: var(--color-ink-900);
+    font-family: var(--font-sans);
+  }
+  ::selection {
+    background: var(--color-copper-100);
+    color: var(--color-copper-700);
+  }
+  input[type="date"]::-webkit-calendar-picker-indicator {
+    opacity: 0.55;
+    cursor: pointer;
+  }
+}
+
+/* Print: only the label sheet */
+@media print {
+  body * {
+    visibility: hidden !important;
+  }
+  .print-area,
+  .print-area * {
+    visibility: visible !important;
+  }
+  .print-area {
+    position: absolute !important;
+    inset: 0 auto auto 0;
+    width: 100%;
+    padding: 12px;
+  }
+  .print-area .label-card {
+    break-inside: avoid;
+    box-shadow: none !important;
+  }
+}
+
+/* Thin scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-paper-200) transparent;
+}
