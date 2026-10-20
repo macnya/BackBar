@@ -15,9 +15,20 @@ export async function api<T = any>(
     credentials: "same-origin",
     cache: "no-store",
   });
-  const data = await res.json().catch(() => ({}));
+
+  const text = await res.text().catch(() => "");
+  let data: any = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    /* not JSON — fall back to text */
+  }
   if (!res.ok || data.ok === false) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+    const msg =
+      data?.error ||
+      (text && text.length < 400 ? text : undefined) ||
+      `Request failed (${res.status})`;
+    throw new Error(msg);
   }
   return data as T;
 }

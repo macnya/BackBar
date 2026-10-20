@@ -1,7 +1,7 @@
 import { loadEnvConfig } from "@next/env";
 import { defineConfig } from "drizzle-kit";
 
-// Load .env.local/.env for local Drizzle CLI commands; Vercel supplies env at runtime.
+// Load .env / .env.local for local Drizzle CLI commands.
 loadEnvConfig(process.cwd());
 
 const url = process.env.DRIZZLE_DATABASE_URL ?? process.env.DATABASE_URL;
