@@ -15,6 +15,69 @@ function errorResponse(msg: string, status = 400) {
   return Response.json({ ok: false, error: msg }, { status });
 }
 
+/**
+ * Drizzle wraps driver errors in a "Failed query: ..." error and puts the real
+ * Postgres error in `.cause`. Walk down to the real one so we can show a
+ * useful message instead of the SQL text.
+ */
+function rootError(err: unknown): { message: string; code?: string } {
+  let e: any = err;
+  for (let i = 0; i < 5 && e?.cause && e.cause !== e; i++) e = e.cause;
+  return {
+    message: String(e?.message ?? err ?? "Unknown error"),
+    code: e?.code ? String(e.code) : undefined,
+  };
+}
+
+function handleError(err: unknown) {
+  console.error("auth route error:", err);
+  const { message, code } = rootError(err);
+
+  // Table missing -> schema was never pushed to this database
+  if (code === "42P01" || /relation ".*" does not exist/i.test(message)) {
+    return errorResponse(
+      "The database tables have not been created yet. Run the setup SQL in the Supabase SQL Editor (or `npx drizzle-kit push`), then try again.",
+      500
+    );
+  }
+  // Unique violation (e.g. two sign-ups with the same email at once)
+  if (code === "23505") {
+    return errorResponse("An account with this email already exists. Try signing in.", 409);
+  }
+  // Wrong DB password
+  if (code === "28P01" || /password authentication failed/i.test(message)) {
+    return errorResponse(
+      "Database login failed. Check the password in DATABASE_URL (it must be your Supabase database password).",
+      500
+    );
+  }
+  // Supabase pooler: wrong username / project ref
+  if (/tenant or user not found/i.test(message)) {
+    return errorResponse(
+      "Database user not recognised. In DATABASE_URL the username must look like postgres.<project-ref> exactly as shown in Supabase > Connect.",
+      500
+    );
+  }
+  // Bad session secret
+  if (/AUTH_SECRET/i.test(message)) {
+    return errorResponse(`Server configuration problem: ${message}`, 500);
+  }
+  // Can't reach DB
+  if (
+    /(ENOTFOUND|ECONN|ETIMEDOUT|EAI_AGAIN|timeout|ssl|self.signed|certificate|no pg_hba|too many connections|terminating connection)/i.test(
+      message
+    )
+  ) {
+    return errorResponse(
+      `Could not reach the database (${message}). Check DATABASE_URL (Supabase pooler, port 6543 on Vercel / 5432 locally) and that the Supabase project is not paused.`,
+      500
+    );
+  }
+
+  const detail = process.env.NODE_ENV === "production" ? "" : ` (${message})`;
+  return errorResponse(`Could not complete the request. Please try again.${detail}`, 500);
+}
+
 export async function POST(req: Request) {
   let body: any = null;
   try {
@@ -54,23 +117,30 @@ export async function POST(req: Request) {
         return errorResponse("An account with this email already exists. Try signing in.", 409);
 
       const hash = bcrypt.hashSync(password, 10);
-      const [user] = await db
-        .insert(users)
-        .values({ name, email, passwordHash: hash })
-        .returning();
-      const [business] = await db
-        .insert(businesses)
-        .values({
-          ownerId: user.id,
-          name: businessName,
-          type:
-            body.businessType === "bar" || body.businessType === "bistro"
-              ? body.businessType
-              : "restaurant",
-          address: String(body.address ?? "").trim(),
-          phone: String(body.phone ?? "").trim(),
-        })
-        .returning();
+
+      // Create the user AND their business together. If either insert fails,
+      // both are rolled back, so you never end up with a half-created account
+      // that then says "email already exists".
+      const { user, business } = await db.transaction(async (tx) => {
+        const [user] = await tx
+          .insert(users)
+          .values({ name, email, passwordHash: hash })
+          .returning();
+        const [business] = await tx
+          .insert(businesses)
+          .values({
+            ownerId: user.id,
+            name: businessName,
+            type:
+              body.businessType === "bar" || body.businessType === "bistro"
+                ? body.businessType
+                : "restaurant",
+            address: String(body.address ?? "").trim(),
+            phone: String(body.phone ?? "").trim(),
+          })
+          .returning();
+        return { user, business };
+      });
 
       const token = await createSessionToken(user.id, business.id);
       await setSessionCookie(token);
@@ -95,19 +165,7 @@ export async function POST(req: Request) {
 
     return errorResponse("Unknown action");
   } catch (err) {
-    console.error("auth route error:", err);
-    const message = err instanceof Error ? err.message : "Something went wrong while signing you up.";
-    if (
-      /(connection|connect|database|ssl|password authentication|ENOTFOUND|ECONN|ETIMEDOUT|no pg_hba|too many connections)/i.test(
-        message
-      )
-    ) {
-      return errorResponse(
-        `Could not reach the database: ${message}. Check that DATABASE_URL points to Supabase Session pooler (port 5432) and SSL is enabled.`,
-        500
-      );
-    }
-    return errorResponse(message, 500);
+    return handleError(err);
   }
 }
 
@@ -116,7 +174,6 @@ export async function GET() {
     const session = await getSession();
     return Response.json({ ok: true, authed: !!session });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Session check failed";
-    return errorResponse(message, 500);
+    return handleError(err);
   }
 }
