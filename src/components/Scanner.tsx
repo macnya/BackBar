@@ -1,28 +1,34 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Html5Qrcode } from "html5-qrcode";
+import { Html5Qrcode, Html5QrcodeSupportedFormats } from "html5-qrcode";
 import { Alert, Spinner } from "@/components/ui";
 
 const REGION_ID = "backbar-scan-region";
 
-async function stopScannerInstance(
-  scanner: Html5Qrcode | null
-): Promise<void> {
-  if (!scanner) return;
+// Formats that cover virtually every product label in a bar/restaurant.
+const FORMATS = [
+  Html5QrcodeSupportedFormats.QR_CODE,
+  Html5QrcodeSupportedFormats.EAN_13,
+  Html5QrcodeSupportedFormats.EAN_8,
+  Html5QrcodeSupportedFormats.UPC_A,
+  Html5QrcodeSupportedFormats.UPC_E,
+  Html5QrcodeSupportedFormats.CODE_128,
+  Html5QrcodeSupportedFormats.CODE_39,
+  Html5QrcodeSupportedFormats.ITF,
+];
 
+async function shutdown(s: Html5Qrcode | null) {
+  if (!s) return;
   try {
-    if (scanner.isScanning) {
-      await scanner.stop();
-    }
+    if (s.isScanning) await s.stop();
   } catch {
-    // The camera may already have stopped or be shutting down.
+    /* already stopped */
   }
-
   try {
-    scanner.clear();
+    s.clear();
   } catch {
-    // The scanner's DOM may already have been cleared.
+    /* DOM already gone */
   }
 }
 
@@ -33,9 +39,8 @@ export function Scanner({
   active: boolean;
   onScan: (code: string) => void;
 }) {
-  const scannerRef = useRef<Html5Qrcode | null>(null);
   const onScanRef = useRef(onScan);
-
+  const scannerRef = useRef<Html5Qrcode | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
 
@@ -43,90 +48,99 @@ export function Scanner({
     onScanRef.current = onScan;
   }, [onScan]);
 
-  useEffect(() => {
+    useEffect(() => {
+    let cancelled = false;
+
     if (!active) {
-      const existing = scannerRef.current;
+      const prev = scannerRef.current;
       scannerRef.current = null;
-      void stopScannerInstance(existing);
+      void shutdown(prev);
+      // Defer the transient-UI reset so it does not run synchronously in the
+      // effect body (react-hooks/set-state-in-effect).
+      queueMicrotask(() => {
+        if (cancelled) return;
+        setStarting(false);
+        setError(null);
+      });
       return;
     }
 
-    let cancelled = false;
-    let scanner: Html5Qrcode | null = null;
-
     const boot = async () => {
-      // Stop any previous camera before creating another instance.
-      const previous = scannerRef.current;
+      const prev = scannerRef.current;
       scannerRef.current = null;
-
-      await stopScannerInstance(previous);
-
+      await shutdown(prev);
       if (cancelled) return;
 
-      // Defer state updates until asynchronous startup begins.
       setError(null);
       setStarting(true);
 
       const target = document.getElementById(REGION_ID);
-
       if (!target) {
         if (!cancelled) {
           setStarting(false);
-          setError("Scanner area could not be initialized. Close and reopen the scanner.");
+          setError("Scanner region missing — close and reopen this page.");
         }
         return;
       }
-
       target.innerHTML = "";
 
+      const instance = new Html5Qrcode(REGION_ID, {
+        verbose: false,
+        formatsToSupport: FORMATS,
+        // Uses the browser's native BarcodeDetector when available (much faster
+        // and more reliable on Android Chrome / recent iOS Safari).
+        experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+      });
+      scannerRef.current = instance;
+
       try {
-        scanner = new Html5Qrcode(REGION_ID, {
-          verbose: false,
-        });
-
-        scannerRef.current = scanner;
-
-        await scanner.start(
+        await instance.start(
           { facingMode: "environment" },
           {
             fps: 10,
-            qrbox: { width: 240, height: 150 },
-            aspectRatio: 4 / 3,
+            // `qrbox` doubles as the visible viewport; keep it wide enough
+            // for EAN-13 labels. Pass a function so the box adapts to
+            // portrait phones.
+            qrbox: (vw, vh) => {
+              const edge = Math.floor(Math.min(vw, vh) * 0.7);
+              return { width: edge, height: Math.floor(edge * 0.6) };
+            },
+            // IMPORTANT: do NOT set aspectRatio here. Setting it forces a crop
+            // that makes portrait previews look black above/below the box.
           },
-          (decodedText) => {
-            if (!cancelled) {
-              onScanRef.current(decodedText);
-            }
+          (text) => {
+            if (!cancelled) onScanRef.current(text);
           },
           () => {
-            // Ignore individual frames that do not contain a readable code.
+            /* per-frame miss */
           }
         );
 
         if (cancelled) {
-          await stopScannerInstance(scanner);
-
-          if (scannerRef.current === scanner) {
-            scannerRef.current = null;
-          }
-
+          await shutdown(instance);
+          if (scannerRef.current === instance) scannerRef.current = null;
           return;
         }
-
         setStarting(false);
-      } catch {
-        if (scannerRef.current === scanner) {
-          scannerRef.current = null;
-        }
+      } catch (err) {
+        if (scannerRef.current === instance) scannerRef.current = null;
+        await shutdown(instance);
+        if (cancelled) return;
+        setStarting(false);
 
-        await stopScannerInstance(scanner);
-
-        if (!cancelled) {
-          setStarting(false);
-          setError(
-            "Unable to start the camera. Check browser camera permissions, ensure the site uses HTTPS, and close other apps using the camera. You can also enter the barcode manually."
-          );
-        }
+        const name = err instanceof Error ? err.name : "";
+        const msg =
+          name === "NotAllowedError"
+            ? "Camera permission was blocked. Tap the lock icon in the address bar → Site settings → Camera → Allow, then reload."
+            : name === "NotFoundError"
+            ? "No camera found on this device. Use manual entry below."
+            : name === "NotReadableError"
+            ? "Camera is in use by another app or tab. Close other camera apps and try again."
+            : name === "OverconstrainedError"
+            ? "This device's rear camera could not satisfy the requested settings. Try again or use manual entry."
+            : "Camera could not start. Make sure the page is served over HTTPS and camera access is allowed.";
+        setError(msg);
+        console.warn("[Scanner] start failed:", name, err);
       }
     };
 
@@ -134,25 +148,25 @@ export function Scanner({
 
     return () => {
       cancelled = true;
-
-      if (scanner && scannerRef.current === scanner) {
+      const inst = scannerRef.current;
+      if (inst) {
         scannerRef.current = null;
+        void shutdown(inst);
       }
-
-      void stopScannerInstance(scanner);
     };
   }, [active]);
 
   return (
     <div>
       <div className="relative min-h-[280px] overflow-hidden rounded-xl bg-dark-900">
+        {/* The element Html5Qrcode owns. Do not conditionally unmount it. */}
         <div
           id={REGION_ID}
-          className="relative min-h-[280px] w-full overflow-hidden rounded-xl bg-dark-900 [&_video]:max-h-[420px] [&_video]:w-full [&_video]:object-cover"
+          className="relative min-h-[280px] w-full overflow-hidden rounded-xl bg-dark-900 [&_video]:w-full [&_video]:h-auto"
         />
 
         {!active && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-dark-300">
+          <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-3 text-dark-300">
             <div className="grid h-16 w-16 place-items-center rounded-xl border border-dark-700">
               <svg
                 viewBox="0 0 24 24"
@@ -168,21 +182,17 @@ export function Scanner({
                 <circle cx="12" cy="12.5" r="3.4" />
               </svg>
             </div>
-
             <p className="px-8 text-center text-sm">
-              Camera is off. Press “Start camera” and point it at a product’s
-              barcode or QR label.
+              Camera is off. Press “Start camera” and point it at a barcode or QR label.
             </p>
           </div>
         )}
 
         {starting && active && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-dark-900/70">
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-dark-900/70">
             <div className="flex flex-col items-center gap-3">
               <Spinner className="border-dark-300 border-t-copper-500" />
-              <p className="text-sm text-dark-300">
-                Starting camera…
-              </p>
+              <p className="text-sm text-dark-300">Starting camera…</p>
             </div>
           </div>
         )}

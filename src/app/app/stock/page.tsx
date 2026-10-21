@@ -1,12 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as XLSX from "xlsx";
 import { api, cn, daysUntil, fmtDate, money, num } from "@/lib/api-client";
 import {
   Alert,
   Badge,
   Button,
-  Card,
   EmptyState,
   Field,
   Input,
@@ -28,6 +28,7 @@ import {
   IconTrash,
   IconIn,
   IconOut,
+  IconUpload,
 } from "@/components/icons";
 import { LabelCard } from "@/components/Barcode";
 
@@ -47,6 +48,20 @@ type Product = {
 };
 
 type Supplier = { id: number; name: string };
+
+type ImportRow = {
+  row: number;
+  name: string;
+  sku: string;
+  category: string;
+  unit: string;
+  quantity: number;
+  costPrice: number;
+  reorderLevel: number;
+  supplierName: string;
+  shelfLifeDays: number | null;
+  expiryDate: string | null;
+};
 
 const UNITS = ["unit", "bottle", "can", "pack", "case", "bag", "box", "carton", "piece", "bunch", "kg", "g", "l", "ml", "portion", "tray"];
 
@@ -71,6 +86,12 @@ export default function StockPage() {
   const [deleteTarget, setDeleteTarget] = useState<Product | null>(null);
   const [labelsFor, setLabelsFor] = useState<Product[] | null>(null);
   const [deleting, setDeleting] = useState(false);
+
+  const [importOpen, setImportOpen] = useState(false);
+  const [importRows, setImportRows] = useState<ImportRow[]>([]);
+  const [importErrors, setImportErrors] = useState<{ row: number; message: string }[]>([]);
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const ok = useCallback((msg: string) => setFlash({ tone: "ok", msg }), []);
   const fail = useCallback((msg: string) => setFlash({ tone: "danger", msg }), []);
@@ -97,9 +118,31 @@ export default function StockPage() {
     }
   }, []);
 
+  // Initial load. setState happens inside the async IIFE after `await`,
+  // which the react-hooks/set-state-in-effect rule allows.
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    let cancelled = false;
+    (async () => {
+      try {
+        const [p, s] = await Promise.all([
+          api<{ items: Product[] }>("/api/products"),
+          api<{ items: Supplier[] }>("/api/suppliers"),
+        ]);
+        if (cancelled) return;
+        setProducts(p.items);
+        setSuppliers(s.items);
+        setLoadError("");
+      } catch (e) {
+        if (cancelled) return;
+        setLoadError(e instanceof Error ? e.message : "Failed to load stock.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const categories = useMemo(
     () => Array.from(new Set(products.map((p) => p.category))).sort(),
@@ -144,6 +187,94 @@ export default function StockPage() {
     }
   };
 
+  const parseFile = async (file: File) => {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: "array", cellDates: false });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    if (!sheet) {
+      setImportRows([]);
+      setImportErrors([{ row: 0, message: "The file has no sheets." }]);
+      return;
+    }
+    const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
+
+    const errors: { row: number; message: string }[] = [];
+    const rows: ImportRow[] = [];
+
+    raw.forEach((r, i) => {
+      const rowNum = i + 2;
+      const pick = (k: string) => String(r[k] ?? r[k.toLowerCase()] ?? "").trim();
+
+      const name = pick("name");
+      const sku = pick("sku");
+      const category = pick("category") || "Uncategorized";
+      const unit = pick("unit").toLowerCase() || "unit";
+      const qtyRaw = pick("quantity");
+      const costRaw = pick("costPrice") || pick("cost_price");
+
+      if (!name) errors.push({ row: rowNum, message: "Missing name" });
+      if (!sku) errors.push({ row: rowNum, message: "Missing sku" });
+      const quantity = Number(qtyRaw);
+      if (!Number.isFinite(quantity) || quantity < 0)
+        errors.push({ row: rowNum, message: `Invalid quantity "${qtyRaw}"` });
+      const costPrice = Number(costRaw || 0);
+      if (!Number.isFinite(costPrice) || costPrice < 0)
+        errors.push({ row: rowNum, message: `Invalid costPrice "${costRaw}"` });
+
+      if (!name || !sku || !Number.isFinite(quantity) || quantity < 0 || !Number.isFinite(costPrice)) return;
+
+      rows.push({
+        row: rowNum,
+        name,
+        sku,
+        category,
+        unit,
+        quantity,
+        costPrice,
+        reorderLevel: Number(pick("reorderLevel") || pick("reorder_level") || 0) || 0,
+        supplierName: pick("supplierName") || pick("supplier_name"),
+        shelfLifeDays: pick("shelfLifeDays") ? Number(pick("shelfLifeDays")) : null,
+        expiryDate: pick("expiryDate") || pick("expiry_date") || null,
+      });
+    });
+
+    const seen = new Map<string, number>();
+    for (const r of rows) {
+      const key = r.sku.toLowerCase();
+      if (seen.has(key)) {
+        errors.push({ row: r.row, message: `Duplicate sku "${r.sku}" also on row ${seen.get(key)}` });
+      } else {
+        seen.set(key, r.row);
+      }
+    }
+
+    setImportRows(rows);
+    setImportErrors(errors);
+  };
+
+  const commitImport = async () => {
+    setImporting(true);
+    try {
+      const res = await api<{ created: number; updated: number; errors: { row: number; message: string }[] }>(
+        "/api/products/import",
+        { body: { rows: importRows, source: "excel" } }
+      );
+      ok(`Import complete: ${res.created} new, ${res.updated} updated.`);
+      if (res.errors.length) {
+        setImportErrors(res.errors);
+      } else {
+        setImportOpen(false);
+        setImportRows([]);
+        setImportErrors([]);
+        await refresh();
+      }
+    } catch (e) {
+      fail(e instanceof Error ? e.message : "Import failed.");
+    } finally {
+      setImporting(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center gap-3 py-24 text-ink-500">
@@ -161,6 +292,9 @@ export default function StockPage() {
         )} on hand at cost`}
         actions={
           <>
+            <Button variant="outline" onClick={() => setImportOpen(true)}>
+              <IconUpload /> Import
+            </Button>
             <Button variant="outline" onClick={() => setLabelsFor(filtered.slice(0, 24))} disabled={filtered.length === 0}>
               <IconPrinter /> Print labels
             </Button>
@@ -302,6 +436,7 @@ export default function StockPage() {
       )}
 
       <ProductForm
+        key={editTarget?.id ?? (formOpen ? "new" : "closed")}
         open={formOpen}
         initial={editTarget}
         suppliers={suppliers}
@@ -316,6 +451,7 @@ export default function StockPage() {
       />
 
       <MoveForm
+        key={moveTarget?.id ?? "closed"}
         product={moveTarget}
         initialType={moveType}
         onClose={() => setMoveTarget(null)}
@@ -364,6 +500,91 @@ export default function StockPage() {
           </div>
         )}
       </Modal>
+
+      <Modal
+        open={importOpen}
+        onClose={() => {
+          if (importing) return;
+          setImportOpen(false);
+          setImportRows([]);
+          setImportErrors([]);
+        }}
+        title="Import stock"
+        wide
+      >
+        <div className="space-y-4">
+          <Alert tone="ok">
+            CSV or XLSX. Required columns: <code>name, sku, category, unit, quantity, costPrice</code>.
+            Optional: <code>reorderLevel, supplierName, shelfLifeDays, expiryDate</code>.
+            Rows whose <code>sku</code> already exists are <strong>updated</strong>; new ones are <strong>created</strong>.
+          </Alert>
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            className="block w-full text-sm file:mr-3 file:rounded-md file:border-0 file:bg-paper-100 file:px-3 file:py-2 file:text-sm file:font-semibold hover:file:bg-paper-50"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void parseFile(f);
+            }}
+          />
+
+          {importErrors.length > 0 && (
+            <div className="max-h-40 overflow-auto rounded-md border border-warn-700/30 bg-warn-100/40 p-3 text-xs">
+              <div className="mb-1 font-semibold text-warn-800">
+                {importErrors.length} row{importErrors.length === 1 ? "" : "s"} need attention
+              </div>
+              <ul className="list-disc pl-4 text-warn-800">
+                {importErrors.map((e, i) => (
+                  <li key={i}>Row {e.row}: {e.message}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {importRows.length > 0 && (
+            <div className="max-h-72 overflow-auto rounded-md border border-line">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-paper-50">
+                  <tr>
+                    <Th>#</Th><Th>Name</Th><Th>SKU</Th><Th>Cat</Th><Th>Unit</Th>
+                    <Th className="text-right">Qty</Th><Th className="text-right">Cost</Th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-line">
+                  {importRows.slice(0, 50).map((r) => (
+                    <tr key={r.sku}>
+                      <Td>{r.row}</Td><Td>{r.name}</Td><Td className="font-mono">{r.sku}</Td>
+                      <Td>{r.category}</Td><Td>{r.unit}</Td>
+                      <Td className="text-right">{r.quantity}</Td>
+                      <Td className="text-right">{money(r.costPrice)}</Td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {importRows.length > 50 && (
+                <div className="p-2 text-center text-xs text-ink-500">
+                  +{importRows.length - 50} more rows…
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 border-t border-line pt-4">
+            <Button
+              variant="outline"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={importing}
+            >
+              Choose file
+            </Button>
+            <Button onClick={commitImport} disabled={importing || importRows.length === 0}>
+              {importing ? "Importing…" : `Import ${importRows.length} row${importRows.length === 1 ? "" : "s"}`}
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </>
   );
 }
@@ -387,50 +608,18 @@ function ProductForm({
   onSaved: (p: Product, isNew: boolean) => void;
   onError: (msg: string) => void;
 }) {
-  const [name, setName] = useState("");
-  const [sku, setSku] = useState("");
-  const [category, setCategory] = useState("");
-  const [unit, setUnit] = useState("unit");
-  const [quantity, setQuantity] = useState("");
-  const [costPrice, setCostPrice] = useState("");
-  const [reorderLevel, setReorderLevel] = useState("");
-  const [supplierId, setSupplierId] = useState("");
-  const [shelfLifeDays, setShelfLifeDays] = useState("");
-  const [expiryDate, setExpiryDate] = useState("");
+  const [name, setName] = useState(initial?.name ?? "");
+  const [sku, setSku] = useState(() => initial?.sku ?? randomSku());
+  const [category, setCategory] = useState(initial?.category ?? "");
+  const [unit, setUnit] = useState(initial?.unit ?? "bottle");
+  const [quantity, setQuantity] = useState(() => (initial ? String(initial.quantity) : ""));
+  const [costPrice, setCostPrice] = useState(() => (initial ? String(initial.costPrice) : ""));
+  const [reorderLevel, setReorderLevel] = useState(() => (initial ? String(initial.reorderLevel) : ""));
+  const [supplierId, setSupplierId] = useState(() => (initial?.supplierId ? String(initial.supplierId) : ""));
+  const [shelfLifeDays, setShelfLifeDays] = useState(() => (initial?.shelfLifeDays ? String(initial.shelfLifeDays) : ""));
+  const [expiryDate, setExpiryDate] = useState(initial?.expiryDate ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [seeded, setSeeded] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    setError("");
-    setBusy(false);
-    if (initial) {
-      setName(initial.name);
-      setSku(initial.sku);
-      setCategory(initial.category);
-      setUnit(initial.unit);
-      setQuantity(String(initial.quantity));
-      setCostPrice(String(initial.costPrice));
-      setReorderLevel(String(initial.reorderLevel));
-      setSupplierId(initial.supplierId ? String(initial.supplierId) : "");
-      setShelfLifeDays(initial.shelfLifeDays ? String(initial.shelfLifeDays) : "");
-      setExpiryDate(initial.expiryDate ?? "");
-      setSeeded(true);
-    } else if (!seeded) {
-      setName("");
-      setSku(randomSku());
-      setCategory("");
-      setUnit("bottle");
-      setQuantity("");
-      setCostPrice("");
-      setReorderLevel("");
-      setSupplierId("");
-      setShelfLifeDays("");
-      setExpiryDate("");
-      setSeeded(true);
-    }
-  }, [open, initial, seeded]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -546,14 +735,6 @@ function MoveForm({
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-
-  useEffect(() => {
-    setType(initialType);
-    setQty("");
-    setNote("");
-    setError("");
-    setBusy(false);
-  }, [product, initialType]);
 
   if (!product) return null;
 
