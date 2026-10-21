@@ -6,7 +6,6 @@ import { Alert, Spinner } from "@/components/ui";
 
 const REGION_ID = "backbar-scan-region";
 
-// Formats that cover virtually every product label in a bar/restaurant.
 const FORMATS = [
   Html5QrcodeSupportedFormats.QR_CODE,
   Html5QrcodeSupportedFormats.EAN_13,
@@ -28,8 +27,22 @@ async function shutdown(s: Html5Qrcode | null) {
   try {
     s.clear();
   } catch {
-    /* DOM already gone */
+    /* DOM gone */
   }
+}
+
+/** Wait for the element to exist — max 30 frames (~500ms). */
+function waitForElement(id: string): Promise<HTMLElement | null> {
+  return new Promise((resolve) => {
+    let tries = 0;
+    const tick = () => {
+      const el = document.getElementById(id);
+      if (el) return resolve(el);
+      if (++tries > 30) return resolve(null);
+      requestAnimationFrame(tick);
+    };
+    tick();
+  });
 }
 
 export function Scanner({
@@ -48,15 +61,13 @@ export function Scanner({
     onScanRef.current = onScan;
   }, [onScan]);
 
-    useEffect(() => {
+  useEffect(() => {
     let cancelled = false;
 
     if (!active) {
       const prev = scannerRef.current;
       scannerRef.current = null;
       void shutdown(prev);
-      // Defer the transient-UI reset so it does not run synchronously in the
-      // effect body (react-hooks/set-state-in-effect).
       queueMicrotask(() => {
         if (cancelled) return;
         setStarting(false);
@@ -74,21 +85,19 @@ export function Scanner({
       setError(null);
       setStarting(true);
 
-      const target = document.getElementById(REGION_ID);
-      if (!target) {
-        if (!cancelled) {
-          setStarting(false);
-          setError("Scanner region missing — close and reopen this page.");
-        }
+      // Wait for React to commit the region <div>.
+      const el = await waitForElement(REGION_ID);
+      if (!el) {
+        if (cancelled) return;
+        setStarting(false);
+        setError("Scanner region did not appear in the DOM. Reload the page and try again.");
         return;
       }
-      target.innerHTML = "";
+      el.innerHTML = "";
 
       const instance = new Html5Qrcode(REGION_ID, {
         verbose: false,
         formatsToSupport: FORMATS,
-        // Uses the browser's native BarcodeDetector when available (much faster
-        // and more reliable on Android Chrome / recent iOS Safari).
         experimentalFeatures: { useBarCodeDetectorIfSupported: true },
       });
       scannerRef.current = instance;
@@ -98,22 +107,17 @@ export function Scanner({
           { facingMode: "environment" },
           {
             fps: 10,
-            // `qrbox` doubles as the visible viewport; keep it wide enough
-            // for EAN-13 labels. Pass a function so the box adapts to
-            // portrait phones.
             qrbox: (vw, vh) => {
               const edge = Math.floor(Math.min(vw, vh) * 0.7);
               return { width: edge, height: Math.floor(edge * 0.6) };
             },
-            // IMPORTANT: do NOT set aspectRatio here. Setting it forces a crop
-            // that makes portrait previews look black above/below the box.
           },
           (text) => {
             if (!cancelled) onScanRef.current(text);
           },
           () => {
             /* per-frame miss */
-          }
+          },
         );
 
         if (cancelled) {
@@ -133,12 +137,12 @@ export function Scanner({
           name === "NotAllowedError"
             ? "Camera permission was blocked. Tap the lock icon in the address bar → Site settings → Camera → Allow, then reload."
             : name === "NotFoundError"
-            ? "No camera found on this device. Use manual entry below."
-            : name === "NotReadableError"
-            ? "Camera is in use by another app or tab. Close other camera apps and try again."
-            : name === "OverconstrainedError"
-            ? "This device's rear camera could not satisfy the requested settings. Try again or use manual entry."
-            : "Camera could not start. Make sure the page is served over HTTPS and camera access is allowed.";
+              ? "No camera found on this device. Use manual entry below."
+              : name === "NotReadableError"
+                ? "Camera is in use by another app or tab. Close other camera apps and try again."
+                : name === "OverconstrainedError"
+                  ? "This device's rear camera could not satisfy the requested settings. Try again or use manual entry."
+                  : "Camera could not start. Make sure the page is served over HTTPS and camera access is allowed.";
         setError(msg);
         console.warn("[Scanner] start failed:", name, err);
       }
@@ -159,7 +163,6 @@ export function Scanner({
   return (
     <div>
       <div className="relative min-h-[280px] overflow-hidden rounded-xl bg-dark-900">
-        {/* The element Html5Qrcode owns. Do not conditionally unmount it. */}
         <div
           id={REGION_ID}
           className="relative min-h-[280px] w-full overflow-hidden rounded-xl bg-dark-900 [&_video]:w-full [&_video]:h-auto"
@@ -182,7 +185,7 @@ export function Scanner({
                 <circle cx="12" cy="12.5" r="3.4" />
               </svg>
             </div>
-            <p className="px-8 text-center text-sm">
+          <p className="px-8 text-center text-sm">
               Camera is off. Press “Start camera” and point it at a barcode or QR label.
             </p>
           </div>
