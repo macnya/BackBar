@@ -50,10 +50,18 @@ const globalForDb = globalThis as typeof globalThis & {
   __arenaNextJsPostgresqlPool?: Pool;
 };
 
+// pg-connection-string (used by pg) treats `sslmode=require` in the URL as
+// "verify-full" and lets it OVERRIDE the `ssl` option below, which causes
+// "self-signed certificate in certificate chain" on Supabase. Remove SSL
+// params from the URL so the `ssl` option built above is the one that applies.
+const connectionString = databaseUrl
+  .replace(/([?&])(sslmode|sslcert|sslkey|sslrootcert|uselibpqcompat)=[^&]*&?/gi, "$1")
+  .replace(/[?&]$/, "");
+
 export const pool =
   globalForDb.__arenaNextJsPostgresqlPool ??
   new Pool({
-    connectionString: databaseUrl,
+    connectionString,
     max: 1,
     idleTimeoutMillis: 20_000,
     connectionTimeoutMillis: 10_000,
