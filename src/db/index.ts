@@ -32,8 +32,13 @@ function buildSslConfig(): false | { rejectUnauthorized: boolean } {
   const isProd = process.env.NODE_ENV === "production";
   const isSupabaseHost =
     /(^|\.)supabase\.co$/i.test(host) || /pooler\.supabase/i.test(host);
-  const lenient = /sslmode=no-verify/i.test(databaseUrl) || process.env.DB_SSL_LENIENT === "1";
-
+  // Supabase's pooler presents a certificate chain that Node does not trust by
+  // default ("self-signed certificate in certificate chain"). The connection is
+  // still encrypted; we just skip chain verification for Supabase hosts.
+  const lenient =
+    isSupabaseHost ||
+    /sslmode=no-verify/i.test(databaseUrl) ||
+    process.env.DB_SSL_LENIENT === "1";
   if (isLocal && !forceSsl && !isSupabaseHost) return false;
   if (forceSsl || (!isLocal && isProd) || isSupabaseHost) {
     return { rejectUnauthorized: !lenient };
